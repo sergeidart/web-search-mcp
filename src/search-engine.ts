@@ -8,14 +8,18 @@ import { BrowserPool } from './browser-pool.js';
 export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
   private browserPool: BrowserPool;
+  private readonly engineFailThreshold: number;
 
   constructor() {
     this.rateLimiter = new RateLimiter(10); // 10 requests per minute
     this.browserPool = new BrowserPool();
+    this.engineFailThreshold = parseInt(process.env.ENGINE_FAIL_THRESHOLD || '5', 10);
+    console.log(`[SearchEngine] Engine fail threshold: ${this.engineFailThreshold}`);
   }
 
   async search(options: SearchOptions): Promise<SearchResultWithMetadata> {
-    const { query, numResults = 5, timeout = 10000 } = options;
+    const defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '15000', 10);
+    const { query, numResults = 5, timeout = defaultTimeout } = options;
     const sanitizedQuery = sanitizeQuery(query);
     
     console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
@@ -32,12 +36,31 @@ export class SearchEngine {
         
         console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}, multi-engine: ${forceMultiEngine}, debug: ${debugBrowsers}`);
 
-        // Try multiple approaches to get search results, starting with most reliable
-        const approaches = [
-          { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
-          { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
-          { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
-        ];
+        // Build approaches list dynamically based on configured browser types
+        const configuredTypes = this.browserPool.getBrowserTypes();
+        console.log(`[SearchEngine] Configured browser types: ${configuredTypes.join(',')}`);
+        
+        const approaches: { method: (q: string, n: number, t: number) => Promise<SearchResult[]>, name: string }[] = [];
+        
+        // chromium → Bing search
+        if (configuredTypes.includes('chromium')) {
+          approaches.push({ method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' });
+        }
+        // firefox → Brave search
+        if (configuredTypes.includes('firefox')) {
+          approaches.push({ method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' });
+        }
+        // webkit → DuckDuckGo (browser-based)
+        if (configuredTypes.includes('webkit')) {
+          approaches.push({ method: this.tryBrowserDuckDuckGoSearch.bind(this), name: 'Browser DuckDuckGo' });
+        }
+        // If no browser types produce any approaches, fall back to axios DuckDuckGo as last resort
+        if (approaches.length === 0) {
+          console.log(`[SearchEngine] No browser approaches configured, using Axios DuckDuckGo as last resort`);
+          approaches.push({ method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' });
+        }
+        
+        console.log(`[SearchEngine] Active approaches: ${approaches.map(a => a.name).join(', ')}`);
         
         let bestResults: SearchResult[] = [];
         let bestEngine = 'None';
@@ -48,8 +71,8 @@ export class SearchEngine {
           try {
             console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
             
-            // Use more aggressive timeouts for faster fallback
-            const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach for faster fallback
+            // Give each approach the full timeout — retries inside each engine are sequential
+            const approachTimeout = timeout;
             const results = await approach.method(sanitizedQuery, numResults, approachTimeout);
             if (results.length > 0) {
               console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
@@ -120,8 +143,9 @@ export class SearchEngine {
   private async tryBrowserBraveSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Trying browser-based Brave search with dedicated browser...`);
     
-    // Try with retry mechanism
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    // Retry up to engineFailThreshold times before giving up
+    const maxAttempts = this.engineFailThreshold;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let browser;
       try {
         // Create a dedicated browser instance for Brave search only
@@ -134,12 +158,15 @@ export class SearchEngine {
           ],
         });
         
-        console.log(`[SearchEngine] Brave search attempt ${attempt}/2 with fresh browser`);
+        console.log(`[SearchEngine] Brave search attempt ${attempt}/${maxAttempts} with fresh browser`);
         const results = await this.tryBrowserBraveSearchInternal(browser, query, numResults, timeout);
+        if (results.length === 0) {
+          throw new Error('Brave search returned 0 results, retrying...');
+        }
         return results;
       } catch (error) {
-        console.error(`[SearchEngine] Brave search attempt ${attempt}/2 failed:`, error);
-        if (attempt === 2) {
+        console.error(`[SearchEngine] Brave search attempt ${attempt}/${maxAttempts} failed:`, error);
+        if (attempt === maxAttempts) {
           throw error; // Re-throw on final attempt
         }
         // Small delay before retry
@@ -156,7 +183,7 @@ export class SearchEngine {
       }
     }
     
-    throw new Error('All Brave search attempts failed');
+    throw new Error(`All Brave search attempts failed (${maxAttempts} attempts)`);
   }
 
   private async tryBrowserBraveSearchInternal(browser: any, query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
@@ -181,13 +208,20 @@ export class SearchEngine {
         console.log(`[SearchEngine] Browser navigating to Brave: ${searchUrl}`);
         
         await page.goto(searchUrl, { 
-          waitUntil: 'domcontentloaded',
+          waitUntil: 'load',
           timeout: timeout
         });
 
+        // Wait for JS-rendered content
+        try {
+          await page.waitForLoadState('networkidle', { timeout: 5000 });
+        } catch {
+          // continue anyway
+        }
+
         // Wait for search results to load
         try {
-          await page.waitForSelector('[data-type="web"]', { timeout: 3000 });
+          await page.waitForSelector('[data-type="web"]', { timeout: Math.min(timeout / 2, 10000) });
         } catch {
           console.log(`[SearchEngine] Browser Brave results selector not found, proceeding anyway`);
         }
@@ -217,11 +251,12 @@ export class SearchEngine {
     const debugBing = process.env.DEBUG_BING_SEARCH === 'true';
     console.error(`[SearchEngine] BING: Starting browser-based search with dedicated browser for query: "${query}"`);
     
-    // Try with retry mechanism
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    // Retry up to engineFailThreshold times before giving up
+    const maxAttempts = this.engineFailThreshold;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let browser;
       try {
-        console.error(`[SearchEngine] BING: Attempt ${attempt}/2 - Launching Chromium browser...`);
+        console.error(`[SearchEngine] BING: Attempt ${attempt}/${maxAttempts} - Launching Chromium browser...`);
         
         // Create a dedicated browser instance for Bing search only
         const { chromium } = await import('playwright');
@@ -241,16 +276,19 @@ export class SearchEngine {
         
         const results = await this.tryBrowserBingSearchInternal(browser, query, numResults, timeout);
         console.error(`[SearchEngine] BING: Search completed successfully with ${results.length} results`);
+        if (results.length === 0) {
+          throw new Error('Bing search returned 0 results, retrying...');
+        }
         return results;
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        console.error(`[SearchEngine] BING: Attempt ${attempt}/2 FAILED with error: ${errorMessage}`);
+        console.error(`[SearchEngine] BING: Attempt ${attempt}/${maxAttempts} FAILED with error: ${errorMessage}`);
         
         if (debugBing) {
           console.error(`[SearchEngine] BING: Full error details:`, error);
         }
         
-        if (attempt === 2) {
+        if (attempt === maxAttempts) {
           console.error(`[SearchEngine] BING: All attempts exhausted, giving up`);
           throw error; // Re-throw on final attempt
         }
@@ -272,7 +310,7 @@ export class SearchEngine {
       }
     }
     
-    throw new Error('All Bing search attempts failed');
+    throw new Error(`All Bing search attempts failed (${maxAttempts} attempts)`);
   }
 
   private async tryBrowserBingSearchInternal(browser: any, query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
@@ -362,7 +400,7 @@ export class SearchEngine {
     // Navigate to Bing homepage first to establish proper session
     const startTime = Date.now();
     await page.goto('https://www.bing.com', { 
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'load',
       timeout: timeout / 2
     });
     
@@ -371,22 +409,29 @@ export class SearchEngine {
     const currentUrl = page.url();
     console.error(`[SearchEngine] BING: Homepage loaded in ${loadTime}ms, title: "${pageTitle}", URL: ${currentUrl}`);
     
-    // Wait a moment for page to fully load
-    await page.waitForTimeout(500);
+    // Wait for page to fully render
+    await page.waitForTimeout(1000);
     
     // Find and use the search box (more realistic than direct URL)
     try {
       console.error(`[SearchEngine] BING: Looking for search form elements...`);
-      await page.waitForSelector('#sb_form_q', { timeout: 2000 });
+      await page.waitForSelector('#sb_form_q', { timeout: 5000 });
       console.error(`[SearchEngine] BING: Search box found, filling with query: "${query}"`);
       await page.fill('#sb_form_q', query);
       
       console.error(`[SearchEngine] BING: Clicking search button and waiting for navigation...`);
       // Submit the search form
       await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: timeout }),
+        page.waitForNavigation({ waitUntil: 'load', timeout: timeout }),
         page.click('#search_icon')
       ]);
+      
+      // Wait for JS-rendered content to finish
+      try {
+        await page.waitForLoadState('networkidle', { timeout: 5000 });
+      } catch {
+        // networkidle may not fire on some pages, continue anyway
+      }
       
       const searchLoadTime = Date.now() - startTime;
       const searchPageTitle = await page.title();
@@ -407,7 +452,7 @@ export class SearchEngine {
     // Wait for search results to load
     try {
       console.error(`[SearchEngine] BING: Waiting for search results to appear...`);
-      await page.waitForSelector('.b_algo, .b_result', { timeout: 3000 });
+      await page.waitForSelector('.b_algo, .b_result', { timeout: Math.min(timeout / 2, 10000) });
       console.error(`[SearchEngine] BING: Search results selector found`);
     } catch {
       console.error(`[SearchEngine] BING: Search results selector not found, proceeding with page content anyway`);
@@ -448,9 +493,16 @@ export class SearchEngine {
     
     const startTime = Date.now();
     await page.goto(searchUrl, { 
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'load',
       timeout: timeout
     });
+    
+    // Wait for JS-rendered content
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 5000 });
+    } catch {
+      // networkidle may not fire, continue anyway
+    }
     
     const loadTime = Date.now() - startTime;
     const pageTitle = await page.title();
@@ -460,7 +512,7 @@ export class SearchEngine {
     // Wait for search results to load
     try {
       console.error(`[SearchEngine] BING: Waiting for search results to appear...`);
-      await page.waitForSelector('.b_algo, .b_result', { timeout: 3000 });
+      await page.waitForSelector('.b_algo, .b_result', { timeout: Math.min(timeout / 2, 10000) });
       console.error(`[SearchEngine] BING: Search results selector found`);
     } catch {
       console.error(`[SearchEngine] BING: Search results selector not found, proceeding with page content anyway`);
@@ -498,6 +550,76 @@ export class SearchEngine {
     return cvid;
   }
 
+
+  private async tryBrowserDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying browser-based DuckDuckGo search with webkit...`);
+
+    const maxAttempts = this.engineFailThreshold;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let browser;
+      try {
+        const { webkit } = await import('playwright');
+        browser = await webkit.launch({
+          headless: process.env.BROWSER_HEADLESS !== 'false',
+        });
+
+        console.log(`[SearchEngine] DuckDuckGo browser attempt ${attempt}/${maxAttempts} with fresh webkit browser`);
+
+        const context = await browser.newContext({
+          userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+          viewport: { width: 1366, height: 768 },
+          locale: 'en-US',
+          timezoneId: 'America/New_York',
+        });
+
+        try {
+          const page = await context.newPage();
+          const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+          console.log(`[SearchEngine] DuckDuckGo browser navigating to: ${searchUrl}`);
+
+          await page.goto(searchUrl, { waitUntil: 'load', timeout });
+
+          // Wait for content to render
+          try {
+            await page.waitForLoadState('networkidle', { timeout: 5000 });
+          } catch {
+            // continue anyway
+          }
+
+          const html = await page.content();
+          console.log(`[SearchEngine] DuckDuckGo browser got HTML length: ${html.length}`);
+
+          const results = this.parseDuckDuckGoResults(html, numResults);
+          console.log(`[SearchEngine] DuckDuckGo browser parsed ${results.length} results`);
+
+          await context.close();
+          if (results.length === 0) {
+            throw new Error('DuckDuckGo browser search returned 0 results, retrying...');
+          }
+          return results;
+        } catch (error) {
+          await context.close();
+          throw error;
+        }
+      } catch (error) {
+        console.error(`[SearchEngine] DuckDuckGo browser attempt ${attempt}/${maxAttempts} failed:`, error);
+        if (attempt === maxAttempts) {
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } finally {
+        if (browser) {
+          try {
+            await browser.close();
+          } catch (closeError) {
+            console.log(`[SearchEngine] Error closing DuckDuckGo browser:`, closeError);
+          }
+        }
+      }
+    }
+
+    throw new Error(`All browser DuckDuckGo search attempts failed (${maxAttempts} attempts)`);
+  }
 
   private async tryDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Trying DuckDuckGo as fallback...`);

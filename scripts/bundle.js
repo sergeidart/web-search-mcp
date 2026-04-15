@@ -51,7 +51,9 @@ try {
       'combined-stream',
       'mime-types',
       'mime-db',
-      'axios'
+      'axios',
+      // Native addon - must stay external
+      'better-sqlite3'
     ],
     sourcemap: true,
     minify: false, // Keep readable for debugging

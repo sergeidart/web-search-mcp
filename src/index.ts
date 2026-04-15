@@ -8,11 +8,15 @@ import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
 import { isPdfUrl } from './utils.js';
+import { ResultStore } from './result-store.js';
+
+const RESULT_STORE_MODE = (process.env.RESULT_STORE_MODE || 'text').toLowerCase() as 'fts' | 'text';
 
 class WebSearchMCPServer {
   private server: McpServer;
   private searchEngine: SearchEngine;
   private contentExtractor: EnhancedContentExtractor;
+  private resultStore: ResultStore | null = null;
 
   constructor() {
     this.server = new McpServer({
@@ -22,6 +26,14 @@ class WebSearchMCPServer {
 
     this.searchEngine = new SearchEngine();
     this.contentExtractor = new EnhancedContentExtractor();
+
+    if (RESULT_STORE_MODE === 'fts') {
+      this.resultStore = new ResultStore();
+      this.resultStore.initialize();
+      console.log(`[MCP] Result store mode: FTS (SQLite + crawl-results tool enabled)`);
+    } else {
+      console.log(`[MCP] Result store mode: text (classic full-content responses)`);
+    }
 
     this.setupTools();
     this.setupGracefulShutdown();
@@ -55,6 +67,7 @@ class WebSearchMCPServer {
           return num;
         }).optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
+      // @ts-ignore TS2589: Zod union+transform+default chains create excessively deep types in TS 5.5+
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: full-web-search`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
@@ -97,6 +110,30 @@ class WebSearchMCPServer {
           
           console.log(`[MCP] Search completed, found ${result.results.length} results`);
           
+          // ── FTS mode: store content, return summaries only ──
+          if (this.resultStore) {
+            const newIds = this.resultStore.storeResults(result.results);
+            this.resultStore.trimOldest(50);
+            const stored = this.resultStore.getResultsByIds(newIds);
+
+            let responseText = `Search completed for "${result.query}" with ${result.total_results} results (content stored — use crawl-results to explore):\n\n`;
+            if (result.status) {
+              responseText += `**Status:** ${result.status}\n\n`;
+            }
+            stored.forEach((sr, idx) => {
+              responseText += `**${idx + 1}. ${sr.title}**\n`;
+              responseText += `URL: ${sr.url}\n`;
+              responseText += `Description: ${sr.description}\n`;
+              responseText += `Word count: ${sr.wordCount} | Paragraphs: ${sr.paragraphCount} | Result ID: ${sr.id}\n`;
+              responseText += `\n---\n\n`;
+            });
+
+            return {
+              content: [{ type: 'text' as const, text: responseText }],
+            };
+          }
+
+          // ── Text mode: full content inline (original behavior) ──
           // Format the results as a comprehensive text response
           let responseText = `Search completed for "${result.query}" with ${result.total_results} results:\n\n`;
           
@@ -160,6 +197,7 @@ class WebSearchMCPServer {
           return num;
         }).default(5).describe('Number of search results to return (1-10)'),
       },
+      // @ts-ignore TS2589: Zod union+transform+default chains create excessively deep types in TS 5.5+
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-web-search-summaries`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
@@ -204,6 +242,23 @@ class WebSearchMCPServer {
             }));
 
             console.log(`[MCP] Search summaries completed, found ${summaryResults.length} results`);
+
+            // In FTS mode, store the summary results so crawl-results can access them
+            if (this.resultStore) {
+              // Convert summaries to SearchResult shape for storage (no full content)
+              const asSearchResults: SearchResult[] = searchResponse.results.map(item => ({
+                title: item.title,
+                url: item.url,
+                description: item.description,
+                fullContent: '',
+                contentPreview: '',
+                wordCount: 0,
+                timestamp: item.timestamp,
+                fetchStatus: 'success' as const,
+              }));
+              this.resultStore.storeResults(asSearchResults);
+              this.resultStore.trimOldest(50);
+            }
             
             // Format the results as text
             let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
@@ -224,13 +279,9 @@ class WebSearchMCPServer {
               ],
             };
           } finally {
-            // Ensure browsers are cleaned up after search-only operations
-            // This prevents EventEmitter memory leaks when browsers accumulate listeners
-            try {
-              await this.searchEngine.closeAll();
-            } catch (cleanupError) {
-              console.error(`[MCP] Error during browser cleanup:`, cleanupError);
-            }
+            // Browser cleanup is handled by each engine's dedicated browser lifecycle.
+            // No need to call closeAll() here — it destroys shared pool state and
+            // causes subsequent calls to fail instantly.
           }
         } catch (error) {
           console.error(`[MCP] Error in get-web-search-summaries tool handler:`, error);
@@ -253,6 +304,7 @@ class WebSearchMCPServer {
           return num;
         }).optional().describe('Maximum characters for the extracted content (0 = no limit, undefined = use default limit). Usually not needed - content length is automatically optimized.'),
       },
+      // @ts-ignore TS2589: Zod union+transform+default chains create excessively deep types in TS 5.5+
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-single-web-page-content`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
@@ -296,7 +348,34 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
 
-          // Format the result as text
+          // ── FTS mode: store page, return summary only ──
+          if (this.resultStore) {
+            const asSearchResult: SearchResult[] = [{
+              title,
+              url: obj.url,
+              description: `Content extracted from ${obj.url}`,
+              fullContent: content,
+              contentPreview: content.length > 500 ? content.substring(0, 500) + '...' : content,
+              wordCount,
+              timestamp: new Date().toISOString(),
+              fetchStatus: 'success',
+            }];
+            const newIds = this.resultStore.storeResults(asSearchResult);
+            this.resultStore.trimOldest(50);
+            const stored = this.resultStore.getResultsByIds(newIds);
+            const sr = stored[0];
+
+            let responseText = `**Page stored from: ${obj.url}** (use crawl-results to explore content)\n\n`;
+            responseText += `**Title:** ${title}\n`;
+            responseText += `**Word Count:** ${wordCount}\n`;
+            responseText += `**Paragraphs:** ${sr?.paragraphCount ?? 0} | Result ID: ${sr?.id ?? 1}\n`;
+
+            return {
+              content: [{ type: 'text' as const, text: responseText }],
+            };
+          }
+
+          // ── Text mode: full content inline (original behavior) ──
           let responseText = `**Page Content from: ${obj.url}**\n\n`;
           responseText += `**Title:** ${title}\n`;
           responseText += `**Word Count:** ${wordCount}\n`;
@@ -322,6 +401,107 @@ class WebSearchMCPServer {
         }
       }
     );
+
+    // ── Tool 4: crawl-results (only in FTS mode) ──
+    if (RESULT_STORE_MODE === 'fts') {
+      this.server.tool(
+        'crawl-results',
+        'Browse and search through content stored by the last web search or page extraction. Use action "list" to see stored pages, "read" to get paragraphs of a specific page, or "search" to find text across all stored content. This tool only works after a web search or page extraction has been performed.',
+        {
+          action: z.enum(['list', 'read', 'search']).describe('Action: "list" = show stored pages, "read" = get paragraphs of a page, "search" = full-text search'),
+          resultId: z.number().optional().describe('(read) The result ID to read paragraphs from'),
+          startParagraph: z.number().optional().describe('(read) Starting paragraph index (0-based, default: 0)'),
+          endParagraph: z.number().optional().describe('(read) Ending paragraph index (inclusive)'),
+          query: z.string().optional().describe('(search) Text to search for across stored content'),
+          limit: z.number().optional().describe('(search) Max results to return (default: 20)'),
+        },
+        async (args) => {
+          console.log(`[MCP] Tool call received: crawl-results`);
+          console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
+
+          if (!this.resultStore) {
+            return {
+              content: [{ type: 'text' as const, text: 'Error: Result store is not available.' }],
+            };
+          }
+
+          try {
+            const { action } = args;
+
+            if (action === 'list') {
+              const results = this.resultStore.listResults();
+              if (results.length === 0) {
+                return {
+                  content: [{ type: 'text' as const, text: 'No stored results. Perform a web search or page extraction first.' }],
+                };
+              }
+              let text = `**Stored Results (${results.length} pages):**\n\n`;
+              results.forEach((r) => {
+                text += `**ID ${r.id}: ${r.title}**\n`;
+                text += `URL: ${r.url}\n`;
+                text += `Description: ${r.description}\n`;
+                text += `Words: ${r.wordCount} | Paragraphs: ${r.paragraphCount}\n`;
+                text += `\n---\n\n`;
+              });
+              return { content: [{ type: 'text' as const, text }] };
+            }
+
+            if (action === 'read') {
+              if (args.resultId === undefined) {
+                return {
+                  content: [{ type: 'text' as const, text: 'Error: "resultId" is required for action "read".' }],
+                };
+              }
+              const paragraphs = this.resultStore.getResultParagraphs(
+                args.resultId,
+                args.startParagraph,
+                args.endParagraph,
+              );
+              if (paragraphs.length === 0) {
+                return {
+                  content: [{ type: 'text' as const, text: `No paragraphs found for result ID ${args.resultId}.` }],
+                };
+              }
+              let text = `**Paragraphs for result ID ${args.resultId}** (${paragraphs.length} paragraphs):\n\n`;
+              paragraphs.forEach((p) => {
+                text += `**[§${p.paragraphIndex}]**\n${p.content}\n\n`;
+              });
+              return { content: [{ type: 'text' as const, text }] };
+            }
+
+            if (action === 'search') {
+              if (!args.query) {
+                return {
+                  content: [{ type: 'text' as const, text: 'Error: "query" is required for action "search".' }],
+                };
+              }
+              const matches = this.resultStore.search(args.query, args.limit);
+              if (matches.length === 0) {
+                return {
+                  content: [{ type: 'text' as const, text: `No matches found for "${args.query}".` }],
+                };
+              }
+              let text = `**Search results for "${args.query}"** (${matches.length} matches):\n\n`;
+              matches.forEach((m, i) => {
+                text += `**${i + 1}. [Result ${m.resultId}, §${m.paragraphIndex}]** — ${m.resultTitle}\n`;
+                text += `URL: ${m.resultUrl}\n`;
+                text += `Snippet: ${m.snippet}\n`;
+                text += `\nFull paragraph:\n${m.content}\n`;
+                text += `\n---\n\n`;
+              });
+              return { content: [{ type: 'text' as const, text }] };
+            }
+
+            return {
+              content: [{ type: 'text' as const, text: `Unknown action: "${action}". Use "list", "read", or "search".` }],
+            };
+          } catch (error) {
+            console.error(`[MCP] Error in crawl-results tool handler:`, error);
+            throw error;
+          }
+        }
+      );
+    }
   }
 
   private validateAndConvertArgs(args: unknown): WebSearchToolInput {
@@ -482,10 +662,11 @@ class WebSearchMCPServer {
       // Don't exit on uncaught exceptions in MCP context
     });
 
-    // Graceful shutdown - close browsers when process exits
+    // Graceful shutdown - close browsers and result store when process exits
     process.on('SIGINT', async () => {
       console.log('Shutting down gracefully...');
       try {
+        this.resultStore?.close();
         await Promise.all([
           this.contentExtractor.closeAll(),
           this.searchEngine.closeAll()
@@ -499,6 +680,7 @@ class WebSearchMCPServer {
     process.on('SIGTERM', async () => {
       console.log('Shutting down gracefully...');
       try {
+        this.resultStore?.close();
         await Promise.all([
           this.contentExtractor.closeAll(),
           this.searchEngine.closeAll()

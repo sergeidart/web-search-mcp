@@ -3,8 +3,15 @@
     "web-search": {
       "command": "node",
       "args": [
-        "/Users/mark/Projects/web-search-mcp/dist/simple-test.js"
-      ]
+        "dist/index.js"
+      ],
+      "env": {
+        "BROWSER_TYPES": "chromium",
+        "BROWSER_HEADLESS": "true",
+        "MAX_BROWSERS": "3",
+        "ENGINE_FAIL_THRESHOLD": "5",
+        "BROWSER_FALLBACK_THRESHOLD": "3"
+      }
     }
   }
 } 

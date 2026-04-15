@@ -78,3 +78,32 @@ export interface SearchResultWithMetadata {
   results: SearchResult[];
   engine: string;
 }
+
+// ── Result Store types (crawl-results / FTS mode) ──
+
+export interface StoredResult {
+  id: number;
+  title: string;
+  url: string;
+  description: string;
+  wordCount: number;
+  fetchStatus: string;
+  timestamp: string;
+  paragraphCount: number;
+}
+
+export interface StoredParagraph {
+  id: number;
+  resultId: number;
+  paragraphIndex: number;
+  content: string;
+}
+
+export interface FtsMatch {
+  resultId: number;
+  paragraphIndex: number;
+  snippet: string;
+  content: string;
+  resultTitle: string;
+  resultUrl: string;
+}

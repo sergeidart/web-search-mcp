@@ -13,9 +13,9 @@ export class BrowserPool {
     this.maxBrowsers = parseInt(process.env.MAX_BROWSERS || '3', 10);
     this.headless = process.env.BROWSER_HEADLESS !== 'false'; // Default to true
     
-    // Configure browser types based on environment
+    // Configure browser types based on environment (normalize to lowercase)
     const browserTypesEnv = process.env.BROWSER_TYPES || 'chromium,firefox';
-    this.browserTypes = browserTypesEnv.split(',').map(type => type.trim());
+    this.browserTypes = browserTypesEnv.split(',').map(type => type.trim().toLowerCase());
     
     console.log(`[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}`);
   }
@@ -127,5 +127,9 @@ export class BrowserPool {
 
   getLastUsedBrowserType(): string {
     return this.lastUsedBrowserType;
+  }
+
+  getBrowserTypes(): string[] {
+    return this.browserTypes;
   }
 }

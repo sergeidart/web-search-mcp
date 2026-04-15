@@ -124,6 +124,7 @@ mcpServers:
         "MAX_CONTENT_LENGTH": "10000",
         "BROWSER_HEADLESS": "true",
         "MAX_BROWSERS": "3",
+        "ENGINE_FAIL_THRESHOLD": "5",
         "BROWSER_FALLBACK_THRESHOLD": "3"
       }
     }
@@ -138,8 +139,9 @@ The server supports several environment variables for configuration:
 - **`MAX_CONTENT_LENGTH`**: Maximum content length in characters (default: 500000)
 - **`DEFAULT_TIMEOUT`**: Default timeout for requests in milliseconds (default: 6000)
 - **`MAX_BROWSERS`**: Maximum number of browser instances to maintain (default: 3)
-- **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'chromium,firefox', options: chromium, firefox, webkit)
-- **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback (default: 3)
+- **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'chromium,firefox', options: chromium, firefox, webkit). Controls which search engines are available: chromium → Bing, firefox → Brave. DuckDuckGo (axios) is always available.
+- **`ENGINE_FAIL_THRESHOLD`**: Number of retry attempts per search engine before falling back to the next engine (default: 5)
+- **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback for content extraction (default: 3)
 
 ### Search Quality and Engine Selection
 
