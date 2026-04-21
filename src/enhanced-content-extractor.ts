@@ -1,9 +1,15 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import * as http from 'http';
+import * as https from 'https';
 import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
+
+// Reusable agents with keep-alive to avoid per-request TCP/TLS handshakes
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
@@ -66,6 +72,8 @@ export class EnhancedContentExtractor {
     const response = await axios.get(url, {
       headers: this.getRandomHeaders(),
       timeout,
+      httpAgent,
+      httpsAgent,
       // Remove maxContentLength from axios config - handle truncation manually
       validateStatus: (status: number) => status < 400,
     });

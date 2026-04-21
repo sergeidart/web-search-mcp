@@ -17,7 +17,12 @@ export class ResultStore {
 
     // Performance pragmas for an ephemeral DB
     this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = OFF');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('cache_size = -64000'); // 64MB query cache
+    this.db.pragma('temp_store = MEMORY');  // Keep temp tables in RAM
+    this.db.pragma('mmap_size = 268435456'); // 256MB memory-mapped I/O
+    this.db.pragma('locking_mode = EXCLUSIVE'); // Single-process, skip lock overhead
+    this.db.pragma('foreign_keys = ON'); // Enforce ON DELETE CASCADE on paragraphs.result_id
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS results (
@@ -38,7 +43,7 @@ export class ResultStore {
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts
-        USING fts5(content, content='paragraphs', content_rowid='id');
+        USING fts5(content, content='paragraphs', content_rowid='id', tokenize='porter');
 
       -- Triggers to keep FTS in sync
       CREATE TRIGGER IF NOT EXISTS paragraphs_ai AFTER INSERT ON paragraphs BEGIN
@@ -48,6 +53,11 @@ export class ResultStore {
       CREATE TRIGGER IF NOT EXISTS paragraphs_ad AFTER DELETE ON paragraphs BEGIN
         INSERT INTO paragraphs_fts(paragraphs_fts, rowid, content) VALUES ('delete', old.id, old.content);
       END;
+
+      -- Performance indexes for faster lookups
+      CREATE INDEX IF NOT EXISTS idx_paragraphs_result_id ON paragraphs(result_id);
+      CREATE INDEX IF NOT EXISTS idx_paragraphs_result_idx ON paragraphs(result_id, paragraph_index);
+      CREATE INDEX IF NOT EXISTS idx_results_timestamp ON results(timestamp);
     `);
 
     console.log(`[ResultStore] Initialized at ${this.dbPath}`);
@@ -81,6 +91,9 @@ export class ResultStore {
     const newIds: number[] = [];
 
     const tx = this.db.transaction((items: SearchResult[]) => {
+      // Disable FTS trigger during bulk insert, rebuild once after
+      this.db!.exec('DROP TRIGGER IF EXISTS paragraphs_ai');
+
       for (const r of items) {
         const info = insertResult.run({
           title: r.title,
@@ -105,6 +118,25 @@ export class ResultStore {
           }
         }
       }
+
+      // Bulk-populate FTS only for paragraphs we just inserted (filter by newIds
+      // to avoid re-indexing previously-stored paragraphs, which would create
+      // duplicate FTS entries and eventually corrupt search results).
+      if (newIds.length > 0) {
+        const placeholders = newIds.map(() => '?').join(',');
+        this.db!.prepare(`
+          INSERT INTO paragraphs_fts(rowid, content)
+          SELECT id, content FROM paragraphs
+          WHERE result_id IN (${placeholders})
+        `).run(...newIds);
+      }
+
+      // Restore the trigger for future single-row inserts
+      this.db!.exec(`
+        CREATE TRIGGER IF NOT EXISTS paragraphs_ai AFTER INSERT ON paragraphs BEGIN
+          INSERT INTO paragraphs_fts(rowid, content) VALUES (new.id, new.content);
+        END
+      `);
     });
 
     tx(results);
@@ -118,10 +150,12 @@ export class ResultStore {
     const count = (this.db.prepare('SELECT COUNT(*) AS cnt FROM results').get() as { cnt: number }).cnt;
     if (count <= max) return;
     const excess = count - max;
+
     // Delete oldest results (lowest IDs) — cascading triggers handle FTS cleanup
+    // Using a single efficient query to delete the excess number of oldest items
     this.db.exec(`
-      DELETE FROM paragraphs WHERE result_id IN (SELECT id FROM results ORDER BY id LIMIT ${excess});
-      DELETE FROM results WHERE id IN (SELECT id FROM results ORDER BY id LIMIT ${excess});
+      DELETE FROM results 
+      WHERE id IN (SELECT id FROM results ORDER BY id ASC LIMIT ${excess})
     `);
     console.log(`[ResultStore] Trimmed ${excess} oldest results (kept ${max})`);
   }
@@ -202,7 +236,8 @@ export class ResultStore {
   search(query: string, limit = 20): FtsMatch[] {
     if (!this.db) return [];
 
-    // Sanitize FTS query: strip special chars that break FTS5 syntax
+    // FTS5 has no backslash-escape for operators. Strip everything except word chars
+    // and whitespace to guarantee a valid query; terms become implicit-AND.
     const sanitized = query.replace(/[^\w\s]/g, ' ').trim();
     if (!sanitized) return [];
 

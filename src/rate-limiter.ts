@@ -9,7 +9,7 @@ export class RateLimiter {
 
   constructor(maxRequestsPerMinute: number = 10) {
     this.maxRequestsPerMinute = maxRequestsPerMinute;
-    this.limit = pLimit(5); // Max 5 concurrent requests
+    this.limit = pLimit(10); // Max 10 concurrent requests
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
