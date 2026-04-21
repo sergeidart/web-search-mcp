@@ -220,6 +220,9 @@ export class EnhancedContentExtractor {
           const html = await http1Page.content();
           const content = this.parseContent(html);
           await http1Context.close();
+          if (this.isLowQualityContent(content)) {
+            throw new Error('Low quality content detected after browser extraction');
+          }
           return content;
         } else {
           throw gotoError;
@@ -244,8 +247,10 @@ export class EnhancedContentExtractor {
       // Extract content using the same logic as axios version
       const html = await page.content();
       const content = this.parseContent(html);
-
       await context.close();
+      if (this.isLowQualityContent(content)) {
+        throw new Error('Low quality content detected after browser extraction');
+      }
       return content;
 
     } catch (error) {
@@ -429,6 +434,9 @@ export class EnhancedContentExtractor {
         
         const content = await Promise.race([extractionPromise, timeoutPromise]);
         const cleanedContent = cleanText(content, this.maxContentLength);
+        if (this.isLowQualityContent(cleanedContent)) {
+          throw new Error('No meaningful content extracted');
+        }
         
         console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
         return {
@@ -479,11 +487,9 @@ export class EnhancedContentExtractor {
     // Remove navigation, header, footer, and other non-content elements
     $('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
     
-    // Remove elements with common ad/tracking classes
-    $('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
-    
-    // Remove elements with common non-content IDs
-    $('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [id*="tooltip"], [id*="toolbar"], [id*="ribbon"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
+    const nonContentAttributePattern = /(^|[-_\s])(ad|ads|advertisement|tracking|analytics|pixel|beacon|sponsored|affiliate|promo|banner|popup|modal|overlay|tooltip|toolbar|ribbon)([-_\s]|$)/i;
+    this.removeNonContentByAttribute($, 'class', nonContentAttributePattern);
+    this.removeNonContentByAttribute($, 'id', nonContentAttributePattern);
     
     // Remove image-related elements and attributes
     $('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
@@ -503,6 +509,10 @@ export class EnhancedContentExtractor {
     
     // Priority selectors for main content
     const contentSelectors = [
+      '#mw-content-text .mw-parser-output',
+      '.mw-parser-output',
+      '#mw-content-text',
+      '#bodyContent',
       'article',
       'main',
       '[role="main"]',
@@ -542,6 +552,35 @@ export class EnhancedContentExtractor {
     const cleanedContent = this.cleanTextContent(mainContent);
     
     return cleanText(cleanedContent, this.maxContentLength);
+  }
+
+  private removeNonContentByAttribute($: cheerio.CheerioAPI, attribute: 'class' | 'id', pattern: RegExp): void {
+    const protectedContentSelector = [
+      'html',
+      'body',
+      'main',
+      'article',
+      '[role="main"]',
+      '#content',
+      '#bodyContent',
+      '#mw-content-text',
+      '.mw-parser-output',
+    ].join(', ');
+
+    $(`[${attribute}]`).each((_index, element) => {
+      const $element = $(element);
+      if ($element.is(protectedContentSelector) || $element.has(protectedContentSelector).length > 0) {
+        return;
+      }
+
+      const value = $element.attr(attribute);
+      if (!value) return;
+
+      const tokens = attribute === 'class' ? value.split(/\s+/) : [value];
+      if (tokens.some(token => pattern.test(token))) {
+        $element.remove();
+      }
+    });
   }
   
   private cleanTextContent(text: string): string {
