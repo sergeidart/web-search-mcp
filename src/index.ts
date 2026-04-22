@@ -67,6 +67,7 @@ class WebSearchMCPServer {
           return num;
         }).optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
       },
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore TS2589: Zod union+transform+default chains create excessively deep types in TS 5.5+
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: full-web-search`);
@@ -116,7 +117,9 @@ class WebSearchMCPServer {
             this.resultStore.trimOldest(50);
             const stored = this.resultStore.getResultsByIds(newIds);
 
-            let responseText = `Search completed for "${result.query}" with ${result.total_results} results (content stored — use crawl-results to explore):\n\n`;
+            let responseText = result.total_results === 0
+              ? `Search returned no results for "${result.query}".\n\n`
+              : `Search completed for "${result.query}" with ${result.total_results} results (content stored - use crawl-results to explore):\n\n`;
             if (result.status) {
               responseText += `**Status:** ${result.status}\n\n`;
             }
@@ -130,12 +133,15 @@ class WebSearchMCPServer {
 
             return {
               content: [{ type: 'text' as const, text: responseText }],
+              ...(result.total_results === 0 ? { isError: true as const } : {}),
             };
           }
 
           // ── Text mode: full content inline (original behavior) ──
           // Format the results as a comprehensive text response
-          let responseText = `Search completed for "${result.query}" with ${result.total_results} results:\n\n`;
+          let responseText = result.total_results === 0
+            ? `Search returned no results for "${result.query}".\n\n`
+            : `Search completed for "${result.query}" with ${result.total_results} results:\n\n`;
           
           // Add status line if available
           if (result.status) {
@@ -175,6 +181,7 @@ class WebSearchMCPServer {
                 text: responseText,
               },
             ],
+            ...(result.total_results === 0 ? { isError: true as const } : {}),
           };
         } catch (error) {
           console.error(`[MCP] Error in tool handler:`, error);
@@ -197,6 +204,7 @@ class WebSearchMCPServer {
           return num;
         }).default(5).describe('Number of search results to return (1-10)'),
       },
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore TS2589: Zod union+transform+default chains create excessively deep types in TS 5.5+
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-web-search-summaries`);
@@ -261,7 +269,9 @@ class WebSearchMCPServer {
             }
             
             // Format the results as text
-            let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
+            let responseText = summaryResults.length === 0
+              ? `Search summaries returned no results for "${obj.query}".\n\n`
+              : `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
             
             summaryResults.forEach((summary, i) => {
               responseText += `**${i + 1}. ${summary.title}**\n`;
@@ -277,6 +287,7 @@ class WebSearchMCPServer {
                   text: responseText,
                 },
               ],
+              ...(summaryResults.length === 0 ? { isError: true as const } : {}),
             };
           } finally {
             // Browser cleanup is handled by each engine's dedicated browser lifecycle.
@@ -304,6 +315,7 @@ class WebSearchMCPServer {
           return num;
         }).optional().describe('Maximum characters for the extracted content (0 = no limit, undefined = use default limit). Usually not needed - content length is automatically optimized.'),
       },
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore TS2589: Zod union+transform+default chains create excessively deep types in TS 5.5+
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-single-web-page-content`);
@@ -548,11 +560,10 @@ class WebSearchMCPServer {
     console.error(`[web-search-mcp] DEBUG: handleWebSearch called with limit=${limit}, includeContent=${includeContent}`);
 
     try {
-      // Request extra search results to account for potential PDF files that will be skipped
-      // Request up to 2x the limit or at least 5 extra results, capped at 10 (Google's max)
+      // Request extra search results to account for extraction failures, capped at 10.
       const searchLimit = includeContent ? Math.min(limit * 2 + 2, 10) : limit;
       
-      console.log(`[web-search-mcp] DEBUG: Requesting ${searchLimit} search results to get ${limit} non-PDF content results`);
+      console.log(`[web-search-mcp] DEBUG: Requesting ${searchLimit} search results to get ${limit} content results`);
       
       // Perform the search
       const searchResponse = await this.searchEngine.search({
@@ -563,8 +574,8 @@ class WebSearchMCPServer {
       
       // Log search summary
       const pdfCount = searchResults.filter(result => isPdfUrl(result.url)).length;
-      const followedCount = searchResults.length - pdfCount;
-      console.error(`[web-search-mcp] DEBUG: Search engine: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained; PDF: ${pdfCount}; ${followedCount} followed.`);
+      const followedCount = searchResults.length;
+      console.error(`[web-search-mcp] DEBUG: Search engine: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained; PDF candidates: ${pdfCount}; ${followedCount} followed.`);
 
       // Extract content from each result if requested, with target count
       const enhancedResults = includeContent 
@@ -572,20 +583,26 @@ class WebSearchMCPServer {
         : searchResults.slice(0, limit); // If not extracting content, just take the first 'limit' results
       
       // Log extraction summary with failure reasons and generate combined status
-      let combinedStatus = `Search engine: ${searchResponse.engine}; ${limit} result requested/${searchResults.length} obtained; PDF: ${pdfCount}; ${followedCount} followed`;
+      let combinedStatus = searchResults.length === 0
+        ? `No search results returned. Search engine: ${searchResponse.engine}; ${limit} results requested/0 obtained; PDF candidates: ${pdfCount}; ${followedCount} followed`
+        : `Search engine: ${searchResponse.engine}; ${limit} results requested/${searchResults.length} obtained; PDF candidates: ${pdfCount}; ${followedCount} followed`;
       
       if (includeContent) {
-        const successCount = enhancedResults.filter(r => r.fetchStatus === 'success').length;
-        const failedResults = enhancedResults.filter(r => r.fetchStatus === 'error');
-        const failedCount = failedResults.length;
-        
-        const failureReasons = this.categorizeFailureReasons(failedResults);
-        const failureReasonText = failureReasons.length > 0 ? ` (${failureReasons.join(', ')})` : '';
-        
-        console.error(`[web-search-mcp] DEBUG: Links requested: ${limit}; Successfully extracted: ${successCount}; Failed: ${failedCount}${failureReasonText}; Results: ${enhancedResults.length}.`);
-        
-        // Add extraction info to combined status
-        combinedStatus += `; Successfully extracted: ${successCount}; Failed: ${failedCount}; Results: ${enhancedResults.length}`;
+        if (searchResults.length === 0) {
+          combinedStatus += `; Content extraction skipped; Results: 0`;
+        } else {
+          const successCount = enhancedResults.filter(r => r.fetchStatus === 'success').length;
+          const failedResults = enhancedResults.filter(r => r.fetchStatus === 'error');
+          const failedCount = failedResults.length;
+          
+          const failureReasons = this.categorizeFailureReasons(failedResults);
+          const failureReasonText = failureReasons.length > 0 ? ` (${failureReasons.join(', ')})` : '';
+          
+          console.error(`[web-search-mcp] DEBUG: Links requested: ${limit}; Successfully extracted: ${successCount}; Failed: ${failedCount}${failureReasonText}; Results: ${enhancedResults.length}.`);
+          
+          // Add extraction info to combined status
+          combinedStatus += `; Successfully extracted: ${successCount}; Failed: ${failedCount}; Results: ${enhancedResults.length}`;
+        }
       }
 
       const searchTime = Date.now() - startTime;

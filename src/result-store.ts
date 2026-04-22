@@ -42,23 +42,14 @@ export class ResultStore {
         content         TEXT NOT NULL
       );
 
-      CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts
-        USING fts5(content, content='paragraphs', content_rowid='id', tokenize='porter');
-
-      -- Triggers to keep FTS in sync
-      CREATE TRIGGER IF NOT EXISTS paragraphs_ai AFTER INSERT ON paragraphs BEGIN
-        INSERT INTO paragraphs_fts(rowid, content) VALUES (new.id, new.content);
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS paragraphs_ad AFTER DELETE ON paragraphs BEGIN
-        INSERT INTO paragraphs_fts(paragraphs_fts, rowid, content) VALUES ('delete', old.id, old.content);
-      END;
-
       -- Performance indexes for faster lookups
       CREATE INDEX IF NOT EXISTS idx_paragraphs_result_id ON paragraphs(result_id);
       CREATE INDEX IF NOT EXISTS idx_paragraphs_result_idx ON paragraphs(result_id, paragraph_index);
       CREATE INDEX IF NOT EXISTS idx_results_timestamp ON results(timestamp);
     `);
+
+    this.ensureFtsTable();
+    this.createFtsTriggers();
 
     console.log(`[ResultStore] Initialized at ${this.dbPath}`);
   }
@@ -69,7 +60,7 @@ export class ResultStore {
     this.db.exec(`
       DELETE FROM paragraphs;
       DELETE FROM results;
-      DELETE FROM paragraphs_fts;
+      INSERT INTO paragraphs_fts(paragraphs_fts) VALUES ('rebuild');
     `);
   }
 
@@ -132,11 +123,7 @@ export class ResultStore {
       }
 
       // Restore the trigger for future single-row inserts
-      this.db!.exec(`
-        CREATE TRIGGER IF NOT EXISTS paragraphs_ai AFTER INSERT ON paragraphs BEGIN
-          INSERT INTO paragraphs_fts(rowid, content) VALUES (new.id, new.content);
-        END
-      `);
+      this.createFtsInsertTrigger();
     });
 
     tx(results);
@@ -236,12 +223,18 @@ export class ResultStore {
   search(query: string, limit = 20): FtsMatch[] {
     if (!this.db) return [];
 
-    // FTS5 has no backslash-escape for operators. Strip everything except word chars
-    // and whitespace to guarantee a valid query; terms become implicit-AND.
-    const sanitized = query.replace(/[^\w\s]/g, ' ').trim();
-    if (!sanitized) return [];
+    const normalized = query.normalize('NFKC').trim();
+    if (!normalized) return [];
 
-    return this.db.prepare(`
+    if (this.shouldUseLikeFallback(normalized)) {
+      return this.searchWithLike(normalized, limit);
+    }
+
+    const ftsQuery = this.buildFtsQuery(normalized);
+    if (!ftsQuery) return this.searchWithLike(normalized, limit);
+
+    try {
+      return this.db.prepare(`
       SELECT
         p.result_id      AS resultId,
         p.paragraph_index AS paragraphIndex,
@@ -255,7 +248,11 @@ export class ResultStore {
       WHERE paragraphs_fts MATCH ?
       ORDER BY rank
       LIMIT ?
-    `).all(sanitized, limit) as FtsMatch[];
+    `).all(ftsQuery, limit) as FtsMatch[];
+    } catch (error) {
+      console.warn(`[ResultStore] FTS query failed, falling back to LIKE: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return this.searchWithLike(normalized, limit);
+    }
   }
 
   /** Cleanup: close DB and remove temp file. */
@@ -269,5 +266,102 @@ export class ResultStore {
       console.log(`[ResultStore] Cleaned up ${this.dbPath}`);
       this.dbPath = null;
     }
+  }
+
+  private ensureFtsTable(): void {
+    if (!this.db) return;
+
+    const existing = this.db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'paragraphs_fts'
+    `).get() as { sql?: string } | undefined;
+
+    if (existing?.sql && !/\btokenize\s*=\s*'?trigram'?/i.test(existing.sql)) {
+      console.log('[ResultStore] Recreating paragraphs_fts with trigram tokenizer');
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS paragraphs_ai;
+        DROP TRIGGER IF EXISTS paragraphs_ad;
+        DROP TABLE IF EXISTS paragraphs_fts;
+      `);
+    }
+
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts
+        USING fts5(content, content='paragraphs', content_rowid='id', tokenize='trigram');
+    `);
+  }
+
+  private createFtsTriggers(): void {
+    if (!this.db) return;
+    this.createFtsInsertTrigger();
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS paragraphs_ad AFTER DELETE ON paragraphs BEGIN
+        INSERT INTO paragraphs_fts(paragraphs_fts, rowid, content) VALUES ('delete', old.id, old.content);
+      END;
+    `);
+  }
+
+  private createFtsInsertTrigger(): void {
+    if (!this.db) return;
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS paragraphs_ai AFTER INSERT ON paragraphs BEGIN
+        INSERT INTO paragraphs_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+    `);
+  }
+
+  private buildFtsQuery(query: string): string {
+    return query
+      .split(/\s+/u)
+      .map(term => term.trim())
+      .filter(Boolean)
+      .map(term => `"${term.replace(/"/g, '""')}"`)
+      .join(' AND ');
+  }
+
+  private shouldUseLikeFallback(query: string): boolean {
+    const terms = query.split(/\s+/u).filter(Boolean);
+    return terms.length === 0 || terms.every(term => Array.from(term).length < 3);
+  }
+
+  private searchWithLike(query: string, limit: number): FtsMatch[] {
+    if (!this.db) return [];
+
+    const likePattern = `%${this.escapeLike(query)}%`;
+    const rows = this.db.prepare(`
+      SELECT
+        p.result_id       AS resultId,
+        p.paragraph_index AS paragraphIndex,
+        p.content,
+        r.title           AS resultTitle,
+        r.url             AS resultUrl
+      FROM paragraphs p
+      JOIN results r ON r.id = p.result_id
+      WHERE p.content LIKE ? ESCAPE '\\'
+      ORDER BY p.result_id, p.paragraph_index
+      LIMIT ?
+    `).all(likePattern, limit) as Omit<FtsMatch, 'snippet'>[];
+
+    return rows.map(row => ({
+      ...row,
+      snippet: this.makeSnippet(row.content, query),
+    }));
+  }
+
+  private escapeLike(query: string): string {
+    return query.replace(/[\\%_]/g, value => `\\${value}`);
+  }
+
+  private makeSnippet(content: string, query: string): string {
+    const index = content.toLocaleLowerCase().indexOf(query.toLocaleLowerCase());
+    if (index < 0) {
+      return content.length > 160 ? `${content.substring(0, 160)}...` : content;
+    }
+
+    const start = Math.max(0, index - 80);
+    const end = Math.min(content.length, index + query.length + 80);
+    const prefix = start > 0 ? '...' : '';
+    const suffix = end < content.length ? '...' : '';
+    return `${prefix}${content.substring(start, end)}${suffix}`;
   }
 }

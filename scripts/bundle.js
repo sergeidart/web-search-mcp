@@ -52,6 +52,9 @@ try {
       'mime-types',
       'mime-db',
       'axios',
+      'pdf-parse',
+      'pdfjs-dist',
+      '@napi-rs/canvas',
       // Native addon - must stay external
       'better-sqlite3'
     ],

@@ -6,6 +6,8 @@ A TypeScript MCP (Model Context Protocol) server that provides comprehensive web
 
 - **Multi-Engine Web Search**: Prioritises Bing > Brave > DuckDuckGo for optimal reliability and performance
 - **Full Page Content Extraction**: Fetches and extracts complete page content from search results
+- **PDF Text Extraction**: Extracts text from text-based PDFs instead of storing raw PDF bytes
+- **Multilingual Stored Search**: FTS mode uses trigram indexing for Unicode text, including CJK and Cyrillic
 - **Multiple Search Tools**: Three specialised tools for different use cases
 - **Smart Request Strategy**: Switches between playwright browesrs and fast axios requests to ensure results are returned
 - **Concurrent Processing**: Extracts content from multiple pages simultaneously
@@ -20,7 +22,7 @@ When a comprehensive search is requested, the server uses an **optimised search 
 2. **Browser-based Brave Search** - Secondary option using dedicated Firefox instance
 3. **Axios DuckDuckGo Search** - Final fallback using traditional HTTP
 4. **Dedicated browser isolation**: Each search engine gets its own browser instance with automatic cleanup
-5. **Content extraction**: Tries axios first, then falls back to browser with human behavior simulation
+5. **Content extraction**: Tries axios first, parses text-based PDFs when detected, then falls back to browser with human behavior simulation for HTML pages
 6. **Concurrent processing**: Extracts content from multiple pages simultaneously with timeout protection
 7. **HTTP/2 error recovery**: Automatically falls back to HTTP/1.1 when protocol errors occur
 
@@ -56,7 +58,7 @@ Older models (even those with tool use specified) may not work or may work errat
 ## Installation (Recommended)
 
 **Requirements:**
-- Node.js 18.0.0 or higher
+- Node.js 20.16+ or 22.3+ (required by the PDF extraction dependency)
 - npm 8.0.0 or higher
 
 1. Download the latest release zip file from the [Releases page](https://github.com/mrkrsl/web-search-mcp/releases)
@@ -137,6 +139,8 @@ mcpServers:
 The server supports several environment variables for configuration:
 
 - **`MAX_CONTENT_LENGTH`**: Maximum content length in characters (default: 500000)
+- **`MAX_PDF_BYTES`**: Maximum PDF download size in bytes before extraction is rejected (default: 20000000)
+- **`ACCEPT_LANGUAGE`**: Accept-Language header and browser locale source used for searches and extraction (default: `en-US,en;q=0.9`)
 - **`DEFAULT_TIMEOUT`**: Default timeout for requests in milliseconds (default: 6000)
 - **`MAX_BROWSERS`**: Maximum number of browser instances to maintain (default: 3)
 - **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'chromium,firefox', options: chromium, firefox, webkit). Controls which search engines are available: chromium → Bing, firefox → Brave. DuckDuckGo (axios) is always available.
@@ -173,6 +177,11 @@ The server supports several environment variables for configuration:
 - **Automatic cleanup**: Browsers are automatically cleaned up after each operation to prevent memory leaks
 - **Limit browsers**: Reduce `MAX_BROWSERS` (default: 3)
 - **EventEmitter warnings**: Fixed - browsers are properly closed to prevent listener accumulation
+
+### PDF and Multilingual Content
+- Text-based PDFs are parsed and stored as extracted text. Scanned or image-only PDFs are not OCR processed; they return a clear extraction failure if no selectable text is available.
+- PDF detection uses URL hints, response `Content-Type`, and `%PDF-` magic bytes, so query-string download URLs such as `?format=pdf` are handled.
+- In `RESULT_STORE_MODE=fts`, `crawl-results search` uses SQLite FTS5 trigram indexing. This supports substring-style matches across Latin, Cyrillic, CJK, Arabic, and mixed-language content. Very short searches, such as two-character terms, fall back to a direct content scan.
 
 ## For Development
 ```bash

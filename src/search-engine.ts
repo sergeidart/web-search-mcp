@@ -1,7 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
-import { generateTimestamp, sanitizeQuery } from './utils.js';
+import { generateTimestamp, getAcceptLanguage, getPrimaryLocale, sanitizeQuery } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
@@ -9,11 +9,15 @@ export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
   private browserPool: BrowserPool;
   private readonly engineFailThreshold: number;
+  private readonly acceptLanguage: string;
+  private readonly primaryLocale: string;
 
   constructor() {
     this.rateLimiter = new RateLimiter(10); // 10 requests per minute
     this.browserPool = new BrowserPool();
     this.engineFailThreshold = parseInt(process.env.ENGINE_FAIL_THRESHOLD || '5', 10);
+    this.acceptLanguage = getAcceptLanguage();
+    this.primaryLocale = getPrimaryLocale();
     console.log(`[SearchEngine] Engine fail threshold: ${this.engineFailThreshold}`);
   }
 
@@ -196,8 +200,11 @@ export class SearchEngine {
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         viewport: { width: 1366, height: 768 },
-        locale: 'en-US',
+        locale: this.primaryLocale,
         timezoneId: 'America/New_York',
+        extraHTTPHeaders: {
+          'Accept-Language': this.acceptLanguage,
+        },
       });
 
       try {
@@ -329,7 +336,7 @@ export class SearchEngine {
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         viewport: { width: 1366, height: 768 },
-        locale: 'en-US',
+        locale: this.primaryLocale,
         timezoneId: 'America/New_York',
         colorScheme: 'light',
         deviceScaleFactor: 1,
@@ -337,7 +344,7 @@ export class SearchEngine {
         isMobile: false,
         extraHTTPHeaders: {
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Language': this.acceptLanguage,
           'Accept-Encoding': 'gzip, deflate, br',
           'DNT': '1',
           'Upgrade-Insecure-Requests': '1',
@@ -568,8 +575,11 @@ export class SearchEngine {
         const context = await browser.newContext({
           userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
           viewport: { width: 1366, height: 768 },
-          locale: 'en-US',
+          locale: this.primaryLocale,
           timezoneId: 'America/New_York',
+          extraHTTPHeaders: {
+            'Accept-Language': this.acceptLanguage,
+          },
         });
 
         try {
@@ -632,7 +642,7 @@ export class SearchEngine {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept-Language': this.acceptLanguage,
           'Accept-Encoding': 'gzip, deflate',
           'DNT': '1',
           'Connection': 'keep-alive',
@@ -901,7 +911,6 @@ export class SearchEngine {
   }
 
   private parseBingResults(html: string, maxResults: number): SearchResult[] {
-    const debugBing = process.env.DEBUG_BING_SEARCH === 'true';
     console.error(`[SearchEngine] BING: Parsing HTML with length: ${html.length}`);
     
     const $ = cheerio.load(html);
@@ -1146,9 +1155,7 @@ export class SearchEngine {
 
     // Extract keywords from the original query (ignore common words)
     const commonWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'group', 'members']);
-    const queryWords = originalQuery.toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
+    const queryWords = (originalQuery.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
       .filter(word => word.length > 2 && !commonWords.has(word));
 
     if (queryWords.length === 0) return 0.5; // Default score if no meaningful keywords

@@ -12,6 +12,7 @@
     "build": "tsc && echo '✅ TypeScript compilation complete: dist/index.js'",
     "dev": "tsx watch src/index.ts",
     "start": "node ./dist/index.js",
+    "test:content": "node tests/test-content-processing.js",
     "lint": "eslint \"src/**/*.ts\"",
     "format": "prettier --write ."
   },
@@ -33,6 +34,7 @@
     "cheerio": "^1.0.0-rc.12",
     "p-limit": "^6.2.0",
     "p-retry": "^6.2.1",
+    "pdf-parse": "^2.4.5",
     "playwright": "^1.48.0",
     "zod": "^3.22.0"
   },

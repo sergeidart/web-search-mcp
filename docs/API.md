@@ -13,6 +13,8 @@ The Web Search MCP Server provides three tools for web searching and content ext
 ### Description
 Search the web and fetch complete page content from top results. This is the most comprehensive web search tool. It searches the web and then follows the resulting links to extract their full page content, providing the most detailed and complete information available.
 
+Text-based PDF results are supported. The server detects PDFs by URL hints, response `Content-Type`, and `%PDF-` file signature, then extracts selectable text before storing or returning content. Scanned/image-only PDFs are not OCR processed.
+
 ### Input Schema
 ```json
 {
@@ -149,7 +151,7 @@ Returns formatted text content containing search result summaries:
 ## Tool: get-single-web-page-content
 
 ### Description
-Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.
+Extract and return the full content from a single web page or text-based PDF URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.
 
 ### Input Schema
 ```json
@@ -264,6 +266,8 @@ Returns formatted text content from the specified web page:
    - Page access denied (403, 404)
    - Content encoding issues
    - Malformed HTML
+   - PDF contains no extractable text
+   - PDF exceeds `MAX_PDF_BYTES`
 
 ### Error Response Format
 ```json
@@ -292,7 +296,8 @@ The server implements rate limiting to respect Google's terms of service:
 - Total response time: 3-15 seconds (depending on result count)
 
 ### Content Limits
-- Maximum content length: 50KB per page
+- Maximum content length: controlled by `MAX_CONTENT_LENGTH` (default 500KB)
+- Maximum PDF download size: controlled by `MAX_PDF_BYTES` (default 20MB)
 - Maximum concurrent requests: 5
 - Request timeout: 10 seconds
 
@@ -307,7 +312,9 @@ The server implements rate limiting to respect Google's terms of service:
       "args": [],
       "env": {
         "GOOGLE_SEARCH_TIMEOUT": "15000",
-        "MAX_CONTENT_LENGTH": "75000"
+        "MAX_CONTENT_LENGTH": "75000",
+        "MAX_PDF_BYTES": "20000000",
+        "ACCEPT_LANGUAGE": "en-US,en;q=0.9"
       }
     }
   }
@@ -337,6 +344,7 @@ The server implements rate limiting to respect Google's terms of service:
 - Check for content extraction errors
 - Handle partial failures gracefully
 - Consider result relevance
+- In FTS result-store mode, stored-content search uses SQLite FTS5 trigram indexing for multilingual text and falls back to direct matching for one- or two-character searches
 
 ### Error Recovery
 - Implement retry logic for transient errors

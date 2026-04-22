@@ -2,10 +2,27 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import * as http from 'http';
 import * as https from 'https';
+import type { AnyNode } from 'domhandler';
 import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
-import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
+import {
+  cleanText,
+  decodeTextBuffer,
+  generateTimestamp,
+  getAcceptLanguage,
+  getContentPreview,
+  getMaxPdfBytes,
+  getNavigatorLanguages,
+  getPrimaryLocale,
+  getWordCount,
+  hasPdfMagicBytes,
+  isPdfContentType,
+  isPdfUrl,
+  isTextLikeContentType,
+  looksLikeBinary,
+} from './utils.js';
 import { BrowserPool } from './browser-pool.js';
+import { extractPdfText } from './pdf-utils.js';
 
 // Reusable agents with keep-alive to avoid per-request TCP/TLS handshakes
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
@@ -14,6 +31,10 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;
+  private readonly maxPdfBytes: number;
+  private readonly acceptLanguage: string;
+  private readonly primaryLocale: string;
+  private readonly navigatorLanguages: string[];
   private browserPool: BrowserPool;
   private fallbackThreshold: number;
 
@@ -29,11 +50,16 @@ export class EnhancedContentExtractor {
       console.warn(`[EnhancedContentExtractor] Invalid MAX_CONTENT_LENGTH value: ${envMaxLength}, using default 500000`);
       this.maxContentLength = 500000;
     }
+
+    this.maxPdfBytes = getMaxPdfBytes();
+    this.acceptLanguage = getAcceptLanguage();
+    this.primaryLocale = getPrimaryLocale();
+    this.navigatorLanguages = getNavigatorLanguages();
     
     this.browserPool = new BrowserPool();
     this.fallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
     
-    console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}`);
+    console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, maxPdfBytes=${this.maxPdfBytes}, acceptLanguage=${this.acceptLanguage}, fallbackThreshold=${this.fallbackThreshold}`);
   }
 
   async extractContent(options: ContentExtractionOptions): Promise<string> {
@@ -69,16 +95,32 @@ export class EnhancedContentExtractor {
   private async extractWithAxios(options: ContentExtractionOptions): Promise<string> {
     const { url, timeout = this.defaultTimeout, maxContentLength = this.maxContentLength } = options;
     
-    const response = await axios.get(url, {
+    const response = await axios.get<ArrayBuffer>(url, {
       headers: this.getRandomHeaders(),
       timeout,
       httpAgent,
       httpsAgent,
-      // Remove maxContentLength from axios config - handle truncation manually
+      responseType: 'arraybuffer',
+      transformResponse: data => data,
+      maxContentLength: this.maxPdfBytes,
       validateStatus: (status: number) => status < 400,
     });
 
-    let content = this.parseContent(response.data);
+    const contentType = this.getHeader(response.headers, 'content-type');
+    const data = this.toUint8Array(response.data);
+    let content: string;
+
+    if (this.isPdfResponse(url, contentType, data)) {
+      if (data.byteLength > this.maxPdfBytes) {
+        throw new Error(`PDF too large: ${data.byteLength} bytes exceeds MAX_PDF_BYTES=${this.maxPdfBytes}`);
+      }
+      content = await extractPdfText(data);
+    } else {
+      if (!isTextLikeContentType(contentType) && looksLikeBinary(data)) {
+        throw new Error(`Unsupported binary content type: ${contentType || 'unknown'}`);
+      }
+      content = this.parseContent(decodeTextBuffer(data, contentType));
+    }
     
     // Truncate content if it exceeds the limit (instead of axios throwing an error)
     if (maxContentLength && content.length > maxContentLength) {
@@ -105,8 +147,11 @@ export class EnhancedContentExtractor {
       const baseContextOptions = {
         userAgent: this.getRandomUserAgent(),
         viewport: this.getRandomViewport(),
-        locale: 'en-US',
+        locale: this.primaryLocale,
         timezoneId: this.getRandomTimezone(),
+        extraHTTPHeaders: {
+          'Accept-Language': this.acceptLanguage,
+        },
         // Simulate real device characteristics
         deviceScaleFactor: Math.random() > 0.5 ? 1 : 2,
         hasTouch: Math.random() > 0.7,
@@ -125,7 +170,7 @@ export class EnhancedContentExtractor {
       const context = await browser.newContext(contextOptions);
 
       // Add stealth scripts to avoid detection
-      await context.addInitScript(() => {
+      await context.addInitScript((languages: string[]) => {
         // Remove webdriver property
         Object.defineProperty(navigator, 'webdriver', {
           get: () => undefined,
@@ -138,14 +183,14 @@ export class EnhancedContentExtractor {
 
         // Mock languages
         Object.defineProperty(navigator, 'languages', {
-          get: () => ['en-US', 'en'],
+          get: () => languages,
         });
 
         // Mock permissions
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
           parameters.name === 'notifications' ?
-            Promise.resolve({ state: 'default' } as unknown as PermissionStatus) :
+            Promise.resolve({ state: 'default' } as unknown as Awaited<ReturnType<typeof originalQuery>>) :
             originalQuery(parameters)
         );
 
@@ -155,7 +200,7 @@ export class EnhancedContentExtractor {
           delete windowWithChrome.chrome.app;
           delete windowWithChrome.chrome.runtime;
         }
-      });
+      }, this.navigatorLanguages);
 
       const page = await context.newPage();
       
@@ -191,11 +236,12 @@ export class EnhancedContentExtractor {
           const http1Context = await browser.newContext({
             userAgent: this.getRandomUserAgent(),
             viewport: this.getRandomViewport(),
-            locale: 'en-US',
+            locale: this.primaryLocale,
             timezoneId: this.getRandomTimezone(),
             extraHTTPHeaders: {
               'Connection': 'keep-alive',
-              'Upgrade-Insecure-Requests': '1'
+              'Upgrade-Insecure-Requests': '1',
+              'Accept-Language': this.acceptLanguage,
             }
           });
           
@@ -322,7 +368,6 @@ export class EnhancedContentExtractor {
 
   private isLowQualityContent(content: string): boolean {
     const lowQualityIndicators = [
-      content.length < 100,
       content.includes('Please enable JavaScript'),
       content.includes('Access Denied'),
       content.includes('403 Forbidden'),
@@ -411,13 +456,11 @@ export class EnhancedContentExtractor {
   }
 
   async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
-    console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
+    console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} extracted results`);
     
-    // Filter out PDF files first
-    const nonPdfResults = results.filter(result => !isPdfUrl(result.url));
-    const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
+    const resultsToProcess = results.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
     
-    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
+    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} results concurrently`);
     
     // Process results concurrently with timeout
     const extractionPromises = resultsToProcess.map(async (result): Promise<SearchResult> => {
@@ -534,7 +577,7 @@ export class EnhancedContentExtractor {
     for (const selector of contentSelectors) {
       const $content = $(selector).first();
       if ($content.length > 0) {
-        mainContent = $content.text().trim();
+        mainContent = this.extractReadableBlocks($, $content);
         if (mainContent.length > 100) { // Ensure we have substantial content
           console.log(`[EnhancedContentExtractor] Found content with selector: ${selector} (${mainContent.length} chars)`);
           break;
@@ -545,13 +588,52 @@ export class EnhancedContentExtractor {
     // If no main content found, try body content
     if (!mainContent || mainContent.length < 100) {
       console.log(`[EnhancedContentExtractor] No main content found, using body content`);
-      mainContent = $('body').text().trim();
+      mainContent = this.extractReadableBlocks($, $('body'));
     }
     
     // Clean up the text
     const cleanedContent = this.cleanTextContent(mainContent);
     
     return cleanText(cleanedContent, this.maxContentLength);
+  }
+
+  private extractReadableBlocks($: cheerio.CheerioAPI, root: cheerio.Cheerio<AnyNode>): string {
+    const blockSelector = [
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      'p',
+      'li',
+      'blockquote',
+      'pre',
+      'td',
+      'th',
+      'figcaption',
+    ].join(', ');
+
+    const blocks: string[] = [];
+    root.find(blockSelector).each((_index, element) => {
+      const text = this.normalizeTextBlock($(element).text());
+      if (text) blocks.push(text);
+    });
+
+    if (blocks.length > 0) {
+      return blocks.join('\n\n');
+    }
+
+    return this.normalizeTextBlock(root.text());
+  }
+
+  private normalizeTextBlock(text: string): string {
+    return text
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map(line => line.replace(/[^\S\n]+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
   }
 
   private removeNonContentByAttribute($: cheerio.CheerioAPI, attribute: 'class' | 'id', pattern: RegExp): void {
@@ -584,21 +666,18 @@ export class EnhancedContentExtractor {
   }
   
   private cleanTextContent(text: string): string {
-    // Remove excessive whitespace
-    text = text.replace(/\s+/g, ' ');
-    
     // Remove image-related text and data URLs
     text = text.replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, ''); // Remove base64 image data
     text = text.replace(/https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)(\?[^\s]*)?/gi, ''); // Remove image URLs
     text = text.replace(/\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)/gi, ''); // Remove image file extensions
-    text = text.replace(/image|img|photo|picture|gallery|slideshow|carousel/gi, ''); // Remove image-related words
     text = text.replace(/click to enlarge|click for full size|view larger|download image/gi, ''); // Remove image action text
-    
-    // Remove common non-content patterns
-    text = text.replace(/cookie|privacy|terms|conditions|disclaimer|legal|copyright|all rights reserved/gi, '');
-    
+
     // Remove excessive line breaks and spacing
-    text = text.replace(/\n\s*\n/g, '\n');
+    text = text
+      .split('\n')
+      .map(line => line.replace(/[^\S\n]+/g, ' ').trim())
+      .join('\n');
+    text = text.replace(/\n{3,}/g, '\n\n');
     text = text.replace(/\r\n/g, '\n');
     text = text.replace(/\r/g, '\n');
     
@@ -633,5 +712,25 @@ export class EnhancedContentExtractor {
 
   async closeAll(): Promise<void> {
     await this.browserPool.closeAll();
+  }
+
+  private isPdfResponse(url: string, contentType: string | undefined, data: Uint8Array): boolean {
+    return isPdfUrl(url) || isPdfContentType(contentType) || hasPdfMagicBytes(data);
+  }
+
+  private toUint8Array(data: ArrayBuffer | Buffer | string): Uint8Array {
+    if (typeof data === 'string') {
+      return Buffer.from(data);
+    }
+    if (Buffer.isBuffer(data)) {
+      return data;
+    }
+    return new Uint8Array(data);
+  }
+
+  private getHeader(headers: Record<string, unknown>, name: string): string | undefined {
+    const value = headers[name] ?? headers[name.toLowerCase()];
+    if (Array.isArray(value)) return value.join(', ');
+    return typeof value === 'string' ? value : undefined;
   }
 }

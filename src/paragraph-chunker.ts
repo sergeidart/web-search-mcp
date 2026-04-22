@@ -1,16 +1,19 @@
-const MIN_CHUNK_LENGTH = 100;
-const MAX_CHUNK_LENGTH = 1800;
+export const MIN_CHUNK_LENGTH = 100;
+export const MAX_CHUNK_LENGTH = 1800;
+
+const SENTENCE_PATTERN = /[^.!?。！？؟؛]+[.!?。！？؟؛]+(?:["')\]\u300d\u300f\u300b\uff09]+)?|[^.!?。！？؟؛]+$/gu;
 
 /**
  * Split text into paragraph-sized chunks suitable for FTS indexing.
- * Splits on double-newlines and markdown heading boundaries,
- * then merges tiny fragments with their neighbors.
+ * Preserves paragraph boundaries where present and enforces MAX_CHUNK_LENGTH
+ * even for binary-like text, long URLs, and languages without whitespace.
  */
 export function chunkIntoParagraphs(text: string): string[] {
   if (!text || !text.trim()) return [];
 
-  // Split on double-newline or markdown headings (keep heading with its content)
-  const raw = text.split(/\n{2,}|(?=^#{1,6}\s)/m);
+  const raw = text
+    .replace(/\r\n?/g, '\n')
+    .split(/\n{2,}|(?=^#{1,6}\s)/m);
 
   const chunks: string[] = [];
   let buffer = '';
@@ -19,35 +22,33 @@ export function chunkIntoParagraphs(text: string): string[] {
     const trimmed = segment.trim();
     if (!trimmed) continue;
 
-    if (buffer.length === 0) {
-      buffer = trimmed;
-    } else {
-      buffer += '\n\n' + trimmed;
-    }
-
-    if (buffer.length >= MIN_CHUNK_LENGTH) {
-      chunks.push(buffer);
+    const candidate = buffer ? `${buffer}\n\n${trimmed}` : trimmed;
+    if (candidate.length > MAX_CHUNK_LENGTH) {
+      pushSplit(chunks, buffer);
       buffer = '';
-    }
-  }
-
-  // Flush remaining buffer
-  if (buffer.length > 0) {
-    if (chunks.length > 0 && buffer.length < MIN_CHUNK_LENGTH) {
-      // Merge tiny trailing fragment with the last chunk
-      chunks[chunks.length - 1] += '\n\n' + buffer;
+      pushSplit(chunks, trimmed);
+    } else if (candidate.length >= MIN_CHUNK_LENGTH) {
+      chunks.push(candidate);
+      buffer = '';
     } else {
-      chunks.push(buffer);
+      buffer = candidate;
     }
   }
 
-  return chunks.flatMap(splitOversizedChunk);
+  pushSplit(chunks, buffer);
+  return mergeTinyChunks(chunks).flatMap(enforceMaxLength);
+}
+
+function pushSplit(chunks: string[], text: string): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  chunks.push(...splitOversizedChunk(trimmed));
 }
 
 function splitOversizedChunk(text: string): string[] {
   if (text.length <= MAX_CHUNK_LENGTH) return [text];
 
-  const sentences = text.match(/[^.!?]+[.!?]+(?:["')\]]+)?|[^.!?]+$/g) ?? [text];
+  const sentences = text.match(SENTENCE_PATTERN) ?? [text];
   const chunks: string[] = [];
   let buffer = '';
 
@@ -62,31 +63,38 @@ function splitOversizedChunk(text: string): string[] {
     const trimmed = sentence.trim();
     if (!trimmed) continue;
 
-    if (trimmed.length > MAX_CHUNK_LENGTH) {
-      flush();
-      chunks.push(...splitByWords(trimmed));
-      continue;
-    }
-
-    const next = buffer ? `${buffer} ${trimmed}` : trimmed;
-    if (next.length > MAX_CHUNK_LENGTH && buffer.length >= MIN_CHUNK_LENGTH) {
-      flush();
-      buffer = trimmed;
-    } else {
-      buffer = next;
+    const pieces = trimmed.length > MAX_CHUNK_LENGTH ? splitByWords(trimmed) : [trimmed];
+    for (const piece of pieces) {
+      const next = buffer ? `${buffer} ${piece}` : piece;
+      if (next.length > MAX_CHUNK_LENGTH && buffer.length >= MIN_CHUNK_LENGTH) {
+        flush();
+        buffer = piece;
+      } else if (next.length > MAX_CHUNK_LENGTH) {
+        flush();
+        chunks.push(...hardSplit(piece));
+      } else {
+        buffer = next;
+      }
     }
   }
 
   flush();
-  return mergeTinyChunks(chunks);
+  return mergeTinyChunks(chunks).flatMap(enforceMaxLength);
 }
 
 function splitByWords(text: string): string[] {
   const chunks: string[] = [];
   let buffer = '';
 
-  for (const word of text.split(/\s+/)) {
+  for (const word of text.split(/\s+/u)) {
     if (!word) continue;
+
+    if (word.length > MAX_CHUNK_LENGTH) {
+      pushSplit(chunks, buffer);
+      buffer = '';
+      chunks.push(...hardSplit(word));
+      continue;
+    }
 
     const next = buffer ? `${buffer} ${word}` : word;
     if (next.length > MAX_CHUNK_LENGTH && buffer.length >= MIN_CHUNK_LENGTH) {
@@ -97,20 +105,46 @@ function splitByWords(text: string): string[] {
     }
   }
 
+  pushSplit(chunks, buffer);
+  return mergeTinyChunks(chunks).flatMap(enforceMaxLength);
+}
+
+function hardSplit(text: string): string[] {
+  const chunks: string[] = [];
+  let buffer = '';
+
+  for (const char of text) {
+    if (buffer.length + char.length > MAX_CHUNK_LENGTH) {
+      if (buffer) chunks.push(buffer);
+      buffer = char;
+    } else {
+      buffer += char;
+    }
+  }
+
   if (buffer) chunks.push(buffer);
-  return mergeTinyChunks(chunks);
+  return chunks;
 }
 
 function mergeTinyChunks(chunks: string[]): string[] {
   const merged: string[] = [];
 
   for (const chunk of chunks) {
-    if (chunk.length < MIN_CHUNK_LENGTH && merged.length > 0) {
-      merged[merged.length - 1] += `\n\n${chunk}`;
+    const previous = merged[merged.length - 1];
+    if (
+      chunk.length < MIN_CHUNK_LENGTH &&
+      previous &&
+      previous.length + 2 + chunk.length <= MAX_CHUNK_LENGTH
+    ) {
+      merged[merged.length - 1] = `${previous}\n\n${chunk}`;
     } else {
       merged.push(chunk);
     }
   }
 
   return merged;
+}
+
+function enforceMaxLength(text: string): string[] {
+  return text.length <= MAX_CHUNK_LENGTH ? [text] : hardSplit(text);
 }
