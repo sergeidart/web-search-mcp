@@ -12,14 +12,114 @@ export class ResultStore {
   initialize(): void {
     if (this.db) return;
 
-    this.dbPath = path.join(os.tmpdir(), `web-search-mcp-${process.pid}.sqlite`);
-    this.db = new Database(this.dbPath);
+    this.dbPath = path.join(os.tmpdir(), this.createDbFileName());
+    this.openDatabase();
+  }
+
+  /** Wipe all rows - called before each new search / page-fetch. */
+  clear(): void {
+    this.runWithSelfHealing(() => {
+      if (!this.db) return;
+      this.db.exec(`
+        DELETE FROM paragraphs;
+        DELETE FROM results;
+        INSERT INTO paragraphs_fts(paragraphs_fts) VALUES ('rebuild');
+      `);
+    }, () => undefined);
+  }
+
+  /** Store a batch of SearchResults, chunking their fullContent into paragraphs.
+   *  Returns the IDs of newly inserted results. */
+  storeResults(results: SearchResult[]): number[] {
+    return this.runWithSelfHealing(
+      () => this.storeResultsOnce(results),
+      () => this.storeResultsOnce(results),
+    );
+  }
+
+  /** Keep at most `max` results, deleting the oldest by ID. */
+  trimOldest(max: number): void {
+    this.runWithSelfHealing(() => {
+      if (!this.db) return;
+      const count = (this.db.prepare('SELECT COUNT(*) AS cnt FROM results').get() as { cnt: number }).cnt;
+      if (count <= max) return;
+      const excess = count - max;
+
+      // Delete oldest results (lowest IDs) - cascading triggers handle FTS cleanup.
+      this.db.exec(`
+        DELETE FROM results
+        WHERE id IN (SELECT id FROM results ORDER BY id ASC LIMIT ${excess})
+      `);
+      console.log(`[ResultStore] Trimmed ${excess} oldest results (kept ${max})`);
+    }, () => undefined);
+  }
+
+  /** Get stored results by their IDs (for showing just-inserted results). */
+  getResultsByIds(ids: number[]): StoredResult[] {
+    return this.runWithSelfHealing(() => this.getResultsByIdsOnce(ids), () => []);
+  }
+
+  /** List all stored results with paragraph counts. */
+  listResults(): StoredResult[] {
+    return this.runWithSelfHealing(() => this.listResultsOnce(), () => []);
+  }
+
+  /** Get paragraphs for a result, optionally paginated. */
+  getResultParagraphs(
+    resultId: number,
+    startParagraph?: number,
+    endParagraph?: number,
+  ): StoredParagraph[] {
+    return this.runWithSelfHealing(
+      () => this.getResultParagraphsOnce(resultId, startParagraph, endParagraph),
+      () => [],
+    );
+  }
+
+  /** Full-text search across all stored paragraphs. */
+  search(query: string, limit = 20): FtsMatch[] {
+    return this.runWithSelfHealing(() => this.searchOnce(query, limit), () => []);
+  }
+
+  /** Cleanup: close DB and remove temp file. */
+  close(): void {
+    this.closeDatabaseHandle();
+    if (this.dbPath) {
+      this.deleteDatabaseFiles(this.dbPath);
+      console.log(`[ResultStore] Cleaned up ${this.dbPath}`);
+      this.dbPath = null;
+    }
+  }
+
+  private openDatabase(): void {
+    if (!this.dbPath) {
+      this.dbPath = path.join(os.tmpdir(), this.createDbFileName());
+    }
+
+    try {
+      this.db = new Database(this.dbPath);
+      this.configureDatabase();
+    } catch (error) {
+      this.closeDatabaseHandle();
+      if (!this.isRecoverableDatabaseError(error)) {
+        throw error;
+      }
+
+      this.deleteDatabaseFiles(this.dbPath);
+      console.warn(`[ResultStore] SQLite store was corrupted during startup and has been recreated: ${this.formatError(error)}`);
+      this.db = new Database(this.dbPath);
+      this.configureDatabase();
+    }
+  }
+
+  private configureDatabase(): void {
+    if (!this.db) return;
 
     // Performance pragmas for an ephemeral DB
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('cache_size = -64000'); // 64MB query cache
-    this.db.pragma('temp_store = MEMORY');  // Keep temp tables in RAM
+    this.db.pragma('temp_store = MEMORY'); // Keep temp tables in RAM
     this.db.pragma('mmap_size = 268435456'); // 256MB memory-mapped I/O
     this.db.pragma('locking_mode = EXCLUSIVE'); // Single-process, skip lock overhead
     this.db.pragma('foreign_keys = ON'); // Enforce ON DELETE CASCADE on paragraphs.result_id
@@ -54,19 +154,7 @@ export class ResultStore {
     console.log(`[ResultStore] Initialized at ${this.dbPath}`);
   }
 
-  /** Wipe all rows — called before each new search / page-fetch. */
-  clear(): void {
-    if (!this.db) return;
-    this.db.exec(`
-      DELETE FROM paragraphs;
-      DELETE FROM results;
-      INSERT INTO paragraphs_fts(paragraphs_fts) VALUES ('rebuild');
-    `);
-  }
-
-  /** Store a batch of SearchResults, chunking their fullContent into paragraphs.
-   *  Returns the IDs of newly inserted results. */
-  storeResults(results: SearchResult[]): number[] {
+  private storeResultsOnce(results: SearchResult[]): number[] {
     if (!this.db) return [];
 
     const insertResult = this.db.prepare(`
@@ -82,7 +170,7 @@ export class ResultStore {
     const newIds: number[] = [];
 
     const tx = this.db.transaction((items: SearchResult[]) => {
-      // Disable FTS trigger during bulk insert, rebuild once after
+      // Disable FTS trigger during bulk insert, rebuild once after.
       this.db!.exec('DROP TRIGGER IF EXISTS paragraphs_ai');
 
       for (const r of items) {
@@ -110,9 +198,7 @@ export class ResultStore {
         }
       }
 
-      // Bulk-populate FTS only for paragraphs we just inserted (filter by newIds
-      // to avoid re-indexing previously-stored paragraphs, which would create
-      // duplicate FTS entries and eventually corrupt search results).
+      // Bulk-populate FTS only for paragraphs we just inserted to avoid duplicate FTS entries.
       if (newIds.length > 0) {
         const placeholders = newIds.map(() => '?').join(',');
         this.db!.prepare(`
@@ -122,7 +208,7 @@ export class ResultStore {
         `).run(...newIds);
       }
 
-      // Restore the trigger for future single-row inserts
+      // Restore the trigger for future single-row inserts.
       this.createFtsInsertTrigger();
     });
 
@@ -131,24 +217,7 @@ export class ResultStore {
     return newIds;
   }
 
-  /** Keep at most `max` results, deleting the oldest by ID. */
-  trimOldest(max: number): void {
-    if (!this.db) return;
-    const count = (this.db.prepare('SELECT COUNT(*) AS cnt FROM results').get() as { cnt: number }).cnt;
-    if (count <= max) return;
-    const excess = count - max;
-
-    // Delete oldest results (lowest IDs) — cascading triggers handle FTS cleanup
-    // Using a single efficient query to delete the excess number of oldest items
-    this.db.exec(`
-      DELETE FROM results 
-      WHERE id IN (SELECT id FROM results ORDER BY id ASC LIMIT ${excess})
-    `);
-    console.log(`[ResultStore] Trimmed ${excess} oldest results (kept ${max})`);
-  }
-
-  /** Get stored results by their IDs (for showing just-inserted results). */
-  getResultsByIds(ids: number[]): StoredResult[] {
+  private getResultsByIdsOnce(ids: number[]): StoredResult[] {
     if (!this.db || ids.length === 0) return [];
 
     const placeholders = ids.map(() => '?').join(',');
@@ -170,8 +239,7 @@ export class ResultStore {
     `).all(...ids) as StoredResult[];
   }
 
-  /** List all stored results with paragraph counts. */
-  listResults(): StoredResult[] {
+  private listResultsOnce(): StoredResult[] {
     if (!this.db) return [];
 
     return this.db.prepare(`
@@ -191,8 +259,7 @@ export class ResultStore {
     `).all() as StoredResult[];
   }
 
-  /** Get paragraphs for a result, optionally paginated. */
-  getResultParagraphs(
+  private getResultParagraphsOnce(
     resultId: number,
     startParagraph?: number,
     endParagraph?: number,
@@ -219,8 +286,7 @@ export class ResultStore {
     return this.db.prepare(sql).all(...params) as StoredParagraph[];
   }
 
-  /** Full-text search across all stored paragraphs. */
-  search(query: string, limit = 20): FtsMatch[] {
+  private searchOnce(query: string, limit: number): FtsMatch[] {
     if (!this.db) return [];
 
     const normalized = query.normalize('NFKC').trim();
@@ -250,21 +316,11 @@ export class ResultStore {
       LIMIT ?
     `).all(ftsQuery, limit) as FtsMatch[];
     } catch (error) {
-      console.warn(`[ResultStore] FTS query failed, falling back to LIKE: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      if (this.isRecoverableDatabaseError(error)) {
+        throw error;
+      }
+      console.warn(`[ResultStore] FTS query failed, falling back to LIKE: ${this.formatError(error)}`);
       return this.searchWithLike(normalized, limit);
-    }
-  }
-
-  /** Cleanup: close DB and remove temp file. */
-  close(): void {
-    if (this.db) {
-      try { this.db.close(); } catch { /* ignore */ }
-      this.db = null;
-    }
-    if (this.dbPath) {
-      try { fs.unlinkSync(this.dbPath); } catch { /* ignore */ }
-      console.log(`[ResultStore] Cleaned up ${this.dbPath}`);
-      this.dbPath = null;
     }
   }
 
@@ -363,5 +419,86 @@ export class ResultStore {
     const prefix = start > 0 ? '...' : '';
     const suffix = end < content.length ? '...' : '';
     return `${prefix}${content.substring(start, end)}${suffix}`;
+  }
+
+  private runWithSelfHealing<T>(operation: () => T, afterHeal: () => T): T {
+    this.initialize();
+
+    try {
+      return operation();
+    } catch (error) {
+      if (!this.isRecoverableDatabaseError(error)) {
+        throw error;
+      }
+
+      console.warn(`[ResultStore] SQLite store was corrupted and has been recreated: ${this.formatError(error)}`);
+      this.recreateDatabase();
+      return afterHeal();
+    }
+  }
+
+  private recreateDatabase(): void {
+    const previousPath = this.dbPath;
+    this.closeDatabaseHandle();
+
+    if (previousPath) {
+      this.deleteDatabaseFiles(previousPath);
+      this.dbPath = previousPath;
+    }
+
+    this.openDatabase();
+  }
+
+  private closeDatabaseHandle(): void {
+    if (this.db) {
+      try {
+        this.db.close();
+      } catch {
+        // ignore cleanup failures
+      }
+      this.db = null;
+    }
+  }
+
+  private deleteDatabaseFiles(dbPath: string): void {
+    for (const filePath of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (error) {
+        if (!this.isMissingFileError(error)) {
+          console.warn(`[ResultStore] Failed to remove SQLite temp file ${filePath}: ${this.formatError(error)}`);
+        }
+      }
+    }
+  }
+
+  private createDbFileName(): string {
+    const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `web-search-mcp-${unique}.sqlite`;
+  }
+
+  private isRecoverableDatabaseError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+
+    const code = this.getErrorCode(error);
+    const message = error.message.toLowerCase();
+    return code === 'SQLITE_CORRUPT'
+      || code === 'SQLITE_NOTADB'
+      || message.includes('database disk image is malformed')
+      || message.includes('file is not a database');
+  }
+
+  private isMissingFileError(error: unknown): boolean {
+    return this.getErrorCode(error) === 'ENOENT';
+  }
+
+  private getErrorCode(error: unknown): string | undefined {
+    if (!(error instanceof Error)) return undefined;
+    const { code } = error as Error & { code?: unknown };
+    return typeof code === 'string' ? code : undefined;
+  }
+
+  private formatError(error: unknown): string {
+    return error instanceof Error ? error.message : 'Unknown error';
   }
 }
